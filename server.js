@@ -6,10 +6,16 @@ const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
-const DATA_DIR = path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'db.json');
-
 /* ------------------------------------------------------------------ DB */
+const IS_VERCEL = !!process.env.VERCEL;
+const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+const STORAGE = REDIS_URL && REDIS_TOKEN ? 'redis' : IS_VERCEL ? 'tmp' : 'file';
+const DATA_DIR = IS_VERCEL ? '/tmp/libri-data' : path.join(__dirname, 'data');
+const DB_FILE = path.join(DATA_DIR, 'db.json');
+const REDIS_KEY = 'libri_db';
+let ORIGIN = `http://localhost:${PORT}`;
+let dirty = false;
 let db;
 const now = () => new Date().toISOString();
 const rid = (n = 16) => crypto.randomBytes(n).toString('hex');
@@ -39,7 +45,7 @@ function defaultDb() {
       pushKey: 'pk_' + rid(18),
       vendi: {
         enabled: true,
-        baseUrl: `http://localhost:${PORT}/mock/vendi-libri`,
+        baseUrl: '/mock/vendi-libri',   // относительный = адрес этого же сайта
         endpoint: '/products',
         authType: 'bearer',          // bearer | header | query | none
         authHeader: 'X-API-Key',     // имя заголовка / query-параметра
@@ -62,15 +68,35 @@ function defaultDb() {
   };
 }
 
-function load() {
+
+const redis = async (cmd, opts = {}) => {
+  const r = await fetch(`${REDIS_URL}/${cmd}`, { ...opts, headers: { Authorization: 'Bearer ' + REDIS_TOKEN } });
+  if (!r.ok) throw new Error(`Redis ${r.status}: ${(await r.text()).slice(0, 120)}`);
+  return r.json();
+};
+function loadFile() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (fs.existsSync(DB_FILE)) db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
   else { db = defaultDb(); save(); }
 }
+/** redis: читаем свежие данные на каждый запрос (serverless-инстансов может быть несколько) */
+async function ensureLoaded() {
+  if (STORAGE === 'redis') {
+    const j = await redis(`get/${REDIS_KEY}`);
+    if (j.result) db = JSON.parse(j.result);
+    else { db = defaultDb(); dirty = true; }
+  } else if (!db) loadFile();
+}
 function save() {
+  if (STORAGE === 'redis') { dirty = true; return; }
   const tmp = DB_FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
   fs.renameSync(tmp, DB_FILE);
+}
+async function persist() {
+  if (STORAGE !== 'redis' || !dirty) return;
+  dirty = false;
+  await redis(`set/${REDIS_KEY}`, { method: 'POST', body: JSON.stringify(db) });
 }
 
 /* ------------------------------------------------------------ Helpers */
@@ -189,7 +215,8 @@ async function fetchVendiItems(v) {
   if (v.apiKey && v.authType === 'bearer') headers.Authorization = 'Bearer ' + v.apiKey;
   if (v.apiKey && v.authType === 'header') headers[v.authHeader || 'X-API-Key'] = v.apiKey;
 
-  const base = v.baseUrl.replace(/\/+$/, '') + '/' + String(v.endpoint || '').replace(/^\/+/, '');
+  const root = v.baseUrl.startsWith('/') ? ORIGIN + v.baseUrl : v.baseUrl;
+  const base = root.replace(/\/+$/, '') + '/' + String(v.endpoint || '').replace(/^\/+/, '');
   const pages = v.pageParam ? Math.max(1, Math.min(100, +v.maxPages || 1)) : 1;
   const all = [];
   for (let p = 1; p <= pages; p++) {
@@ -246,10 +273,22 @@ const publicProduct = (p) => ({
 });
 
 /* ----------------------------------------------------------------- App */
-load();
+if (STORAGE !== 'redis') loadFile();
 const app = express();
+app.set('trust proxy', true);
 app.use(express.json({ limit: '5mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+app.use(async (req, res, next) => {
+  ORIGIN = `${req.protocol}://${req.get('host')}`;
+  try { await ensureLoaded(); } catch (e) { return res.status(500).json({ error: 'Хранилище недоступно: ' + e.message }); }
+  const end = res.end.bind(res);          // сохраняем в Redis ДО отправки ответа
+  res.end = (...args) => {
+    if (!dirty) return end(...args);
+    persist().catch((e) => console.error('persist failed', e)).finally(() => end(...args));
+    return res;
+  };
+  next();
+});
 
 /* ---- Public API */
 app.get('/api/config', (req, res) => res.json(db.settings.shop));
@@ -372,7 +411,7 @@ const admin = express.Router();
 admin.use(adminAuth);
 
 admin.get('/stats', (req, res) => res.json({
-  products: db.products.length, orders: db.orders.length,
+  storage: STORAGE, products: db.products.length, orders: db.orders.length,
   revenue: db.orders.filter((o) => o.status !== 'cancelled').reduce((s, o) => s + o.total, 0),
 }));
 
@@ -464,19 +503,32 @@ admin.post('/integration/import', async (req, res) => {
 });
 app.use('/api/admin', admin);
 
+/* Cron (Vercel): GET /api/cron/sync с заголовком Authorization: Bearer $CRON_SECRET */
+app.get('/api/cron/sync', async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret || req.get('authorization') !== 'Bearer ' + secret) return res.status(403).json({ error: 'forbidden' });
+  try { res.json(await runImport()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
-/* Автосинхронизация */
-setInterval(async () => {
-  const v = db.settings.vendi;
-  if (!v.enabled || !v.autoSyncMinutes) return;
-  const last = v.lastSync ? Date.parse(v.lastSync) : 0;
-  if (Date.now() - last < v.autoSyncMinutes * 60000) return;
-  try { await runImport(); console.log('[autosync] ok', v.lastResult); }
-  catch (e) { v.lastSync = now(); v.lastResult = { error: e.message }; save(); console.log('[autosync] error', e.message); }
+/* Автосинхронизация (только на обычном сервере; на Vercel — cron) */
+if (!IS_VERCEL) setInterval(async () => {
+  try {
+    await ensureLoaded();
+    const v = db.settings.vendi;
+    if (!v.enabled || !v.autoSyncMinutes) return;
+    const last = v.lastSync ? Date.parse(v.lastSync) : 0;
+    if (Date.now() - last < v.autoSyncMinutes * 60000) return;
+    try { await runImport(); console.log('[autosync] ok', v.lastResult); }
+    catch (e) { v.lastSync = now(); v.lastResult = { error: e.message }; save(); console.log('[autosync] error', e.message); }
+    await persist();
+  } catch (e) { console.log('[autosync] storage error', e.message); }
 }, 30000);
 
-app.listen(PORT, () => {
-  console.log(`Магазин:  http://localhost:${PORT}`);
-  console.log(`Админка:  http://localhost:${PORT}/admin/  (пароль: ${ADMIN_PASSWORD})`);
-});
+module.exports = app;
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Магазин:  http://localhost:${PORT}`);
+    console.log(`Админка:  http://localhost:${PORT}/admin/  (пароль: ${ADMIN_PASSWORD})`);
+  });
+}

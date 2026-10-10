@@ -1,0 +1,7 @@
+{
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api/index" },
+    { "source": "/mock/:path*", "destination": "/api/index" }
+  ],
+  "crons": [{ "path": "/api/cron/sync", "schedule": "0 6 * * *" }]
+}

@@ -16,3 +16,11 @@ index · catalog (поиск/фильтры) · product · cart (оформле�
 2. Push: приложение шлёт POST /api/v1/products с X-API-Key (ключ во вкладке «API для приложения»).
 По умолчанию подключён встроенный демо-сервер (/mock/vendi-libri, ключ demo-key) — импорт работает сразу.
 Для реального Vendi Libri замените Base URL, ключ и маппинг по его документации.
+
+## Деплой на Vercel
+1. Залейте проект на GitHub и импортируйте в Vercel (Framework: Other, настройки по умолчанию).
+2. **Обязательно** подключите хранилище: Vercel → Storage → Marketplace → *Upstash Redis* → Connect to Project.
+   Переменные `KV_REST_API_URL` / `KV_REST_API_TOKEN` добавятся сами. Без этого данные на Vercel не сохраняются.
+3. В Settings → Environment Variables добавьте `ADMIN_PASSWORD` (свой пароль админки) и, по желанию, `CRON_SECRET` (ежедневная автосинхронизация).
+4. Redeploy. Админка: `https://ваш-домен/admin/`.
+Если на проекте включена Deployment Protection, демо-импорт (запрос сайта к самому себе) может получать 401 — отключите защиту для Production или используйте реальный API.
